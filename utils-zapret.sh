@@ -15,6 +15,12 @@ LIST_EXCLUDE="/opt/zapret/hostlists/list-exclude-user.txt"
 CONFIG_FILE="/opt/zapret/config"
 IP="203.0.113.113/32"
 SERVICE_NAME="zapret"
+PROJECT_DIR="$HOME/zapret-configs"
+UPDATE_STATE_DIR="$PROJECT_DIR/.updates"
+UPDATE_BACKUP_DIR="$UPDATE_STATE_DIR/backups"
+UPDATE_BRANCH="main"
+UPDATE_ARCHIVE_URL="https://codeload.github.com/kartavkun/zapret-discord-youtube/tar.gz/refs/heads/$UPDATE_BRANCH"
+SELECTED_BACKUP_DIR=""
 
 # Функция для определения доступной утилиты повышения привилегий
 detect_privilege_escalation() {
@@ -654,6 +660,319 @@ update_ipset() {
   fi
 }
 
+download_file() {
+  local url="$1"
+  local output="$2"
+
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL -o "$output" "$url"
+  elif command -v wget >/dev/null 2>&1; then
+    wget -q -O "$output" "$url"
+  else
+    echo -e "${RED}Ошибка: curl или wget не найден${RESET}"
+    return 1
+  fi
+}
+
+get_current_project_commit() {
+  if [ -f "$UPDATE_STATE_DIR/current_commit" ]; then
+    head -n 1 "$UPDATE_STATE_DIR/current_commit"
+    return
+  fi
+
+  if command -v git >/dev/null 2>&1 && [ -d "$PROJECT_DIR/.git" ]; then
+    git -C "$PROJECT_DIR" rev-parse HEAD 2>/dev/null && return
+  fi
+
+  echo "unknown"
+}
+
+ensure_project_dir() {
+  if [ -d "$PROJECT_DIR" ]; then
+    return 0
+  fi
+
+  echo -e "${RED}Ошибка: папка $PROJECT_DIR не найдена${RESET}"
+  return 1
+}
+
+validate_update_source() {
+  local source_dir="$1"
+  local required_path
+
+  for required_path in setup.sh install.sh utils-zapret.sh configs hostlists utils; do
+    if [ ! -e "$source_dir/$required_path" ]; then
+      echo -e "${RED}Ошибка: в архиве нет $required_path${RESET}"
+      return 1
+    fi
+  done
+}
+
+get_archive_commit() {
+  local source_dir="$1"
+  local archive_name
+  local archive_commit
+
+  archive_name=$(basename "$source_dir")
+  archive_commit="${archive_name##*-}"
+
+  if [[ "$archive_commit" =~ ^[0-9a-f]{40}$ ]]; then
+    echo "$archive_commit"
+  else
+    echo "$UPDATE_BRANCH"
+  fi
+}
+
+create_project_backup() {
+  local backup_dir="$1"
+  local from_commit="$2"
+  local to_commit="$3"
+
+  mkdir -p "$backup_dir/files" || return 1
+  tar -C "$PROJECT_DIR" \
+    --exclude='./.updates' \
+    --exclude='./.git' \
+    -cf - . | tar -C "$backup_dir/files" -xf - || return 1
+
+  {
+    printf 'from_commit=%s\n' "$from_commit"
+    printf 'to_commit=%s\n' "$to_commit"
+    printf 'date=%s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+  } > "$backup_dir/metadata"
+}
+
+clear_project_files() {
+  find "$PROJECT_DIR" -mindepth 1 -maxdepth 1 \
+    ! -name '.updates' \
+    ! -name '.git' \
+    -exec rm -rf {} +
+}
+
+copy_project_tree() {
+  local source_dir="$1"
+
+  tar -C "$source_dir" -cf - . | tar -C "$PROJECT_DIR" -xf -
+}
+
+apply_project_update() {
+  local source_dir="$1"
+
+  clear_project_files || return 1
+  copy_project_tree "$source_dir"
+}
+
+update_project_files() {
+  local current_commit
+  local latest_commit
+  local archive_file
+  local temp_dir
+  local source_dir
+  local backup_dir
+  local last_backup_dir
+  local answer
+
+  echo "Обновление файлов zapret-discord-youtube..."
+  echo "Будет изменена только папка: $PROJECT_DIR"
+  echo
+  ensure_project_dir || return 1
+  read -rp "Продолжить? [Y/n]: " answer || return 1
+  case "${answer,,}" in
+    y|yes|"") ;;
+    n|no) echo "Обновление отменено"; return 1 ;;
+    *) echo -e "${RED}Неверный ввод${RESET}"; return 1 ;;
+  esac
+
+  if ! command -v tar >/dev/null 2>&1; then
+    echo -e "${RED}Ошибка: tar не найден${RESET}"
+    return 1
+  fi
+
+  current_commit=$(get_current_project_commit)
+  archive_file=$(mktemp "/tmp/zapret-update.XXXXXX.tar.gz") || return 1
+  temp_dir=$(mktemp -d "/tmp/zapret-update.XXXXXX") || {
+    rm -f "$archive_file"
+    return 1
+  }
+
+  if ! download_file "$UPDATE_ARCHIVE_URL" "$archive_file"; then
+    echo -e "${RED}Ошибка: не удалось скачать архив обновления${RESET}"
+    rm -rf "$temp_dir" "$archive_file"
+    return 1
+  fi
+
+  if ! tar -xzf "$archive_file" -C "$temp_dir"; then
+    echo -e "${RED}Ошибка: не удалось распаковать архив обновления${RESET}"
+    rm -rf "$temp_dir" "$archive_file"
+    return 1
+  fi
+
+  source_dir=$(find "$temp_dir" -mindepth 1 -maxdepth 1 -type d | head -n 1)
+  if [ -z "$source_dir" ] || ! validate_update_source "$source_dir"; then
+    rm -rf "$temp_dir" "$archive_file"
+    return 1
+  fi
+  latest_commit=$(get_archive_commit "$source_dir")
+
+  if project_matches_tree "$source_dir"; then
+    rm -rf "$temp_dir" "$archive_file"
+    echo -e "${GREEN}Файлы уже актуальны, обновление не требуется${RESET}"
+    return 0
+  fi
+
+  last_backup_dir=$(latest_backup_dir)
+  if project_matches_backup "$last_backup_dir"; then
+    backup_dir="$last_backup_dir"
+    echo -e "${YELLOW}Резервная копия уже актуальна: $backup_dir${RESET}"
+  else
+    backup_dir="$UPDATE_BACKUP_DIR/$(date '+%Y-%m-%d_%H-%M-%S')"
+    if ! create_project_backup "$backup_dir" "$current_commit" "$latest_commit"; then
+      echo -e "${RED}Ошибка: не удалось создать резервную копию${RESET}"
+      rm -rf "$temp_dir" "$archive_file"
+      return 1
+    fi
+    echo -e "${GREEN}Резервная копия создана: $backup_dir${RESET}"
+  fi
+
+  if ! apply_project_update "$source_dir"; then
+    echo -e "${RED}Ошибка: не удалось обновить файлы${RESET}"
+    echo "Резервная копия: $backup_dir"
+    rm -rf "$temp_dir" "$archive_file"
+    return 1
+  fi
+
+  mkdir -p "$UPDATE_STATE_DIR"
+  printf '%s\n' "$latest_commit" > "$UPDATE_STATE_DIR/current_commit"
+  rm -rf "$temp_dir" "$archive_file"
+  echo -e "${GREEN}Файлы успешно обновлены${RESET}"
+  exit 0
+}
+
+latest_backup_dir() {
+  find "$UPDATE_BACKUP_DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort | tail -n 1
+}
+
+list_backup_dirs() {
+  find "$UPDATE_BACKUP_DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort
+}
+
+select_backup_dir() {
+  local -a backups
+  local backup
+  local choice
+  local index
+
+  SELECTED_BACKUP_DIR=""
+  mapfile -t backups < <(list_backup_dirs)
+  case "${#backups[@]}" in
+    0) return 1 ;;
+    1)
+      SELECTED_BACKUP_DIR="${backups[0]}"
+      return 0
+      ;;
+  esac
+
+  echo "Найдено несколько резервных копий:"
+  echo "1. Использовать последнюю: ${backups[$((${#backups[@]} - 1))]}"
+  echo "2. Выбрать вручную"
+  echo "0. Назад"
+  echo
+  read -rp "Выберите действие: " choice || return 2
+
+  case "$choice" in
+    1) SELECTED_BACKUP_DIR="${backups[$((${#backups[@]} - 1))]}" ;;
+    2)
+      echo
+      echo "Доступные резервные копии:"
+      index=1
+      for backup in "${backups[@]}"; do
+        echo "[$index] $backup"
+        index=$((index + 1))
+      done
+      echo "0. Назад"
+      echo
+      read -rp "Выберите резервную копию: " choice || return 2
+      if [ "$choice" = "0" ]; then
+        return 2
+      fi
+      if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt "${#backups[@]}" ]; then
+        echo -e "${RED}Неверный выбор${RESET}"
+        return 2
+      fi
+      SELECTED_BACKUP_DIR="${backups[$((choice - 1))]}"
+      ;;
+    0) return 2 ;;
+    *)
+      echo -e "${RED}Неверный выбор${RESET}"
+      return 2
+      ;;
+  esac
+}
+
+project_matches_backup() {
+  local backup_dir="$1"
+
+  [ -d "$backup_dir/files" ] || return 1
+  command -v diff >/dev/null 2>&1 || return 1
+  diff -qr -x .updates -x .git "$PROJECT_DIR" "$backup_dir/files" >/dev/null 2>&1
+}
+
+project_matches_tree() {
+  local source_dir="$1"
+
+  command -v diff >/dev/null 2>&1 || return 1
+  diff -qr -x .updates -x .git "$PROJECT_DIR" "$source_dir" >/dev/null 2>&1
+}
+
+rollback_project_update() {
+  local backup_dir
+  local from_commit
+  local answer
+  local select_status
+
+  ensure_project_dir || return 1
+  select_backup_dir
+  select_status=$?
+  case "$select_status" in
+    0) ;;
+    1) echo -e "${YELLOW}Нет резервной копии для отката${RESET}"; return 1 ;;
+    *) echo "Откат отменён"; return 1 ;;
+  esac
+  backup_dir="$SELECTED_BACKUP_DIR"
+  if [ -z "$backup_dir" ] || [ ! -d "$backup_dir/files" ]; then
+    echo -e "${YELLOW}Нет резервной копии для отката${RESET}"
+    return 1
+  fi
+
+  echo "Откат файлов zapret-discord-youtube..."
+  echo "Резервная копия: $backup_dir"
+  echo "Будет изменена только папка: $PROJECT_DIR"
+  echo
+  read -rp "Продолжить? [Y/n]: " answer || return 1
+  case "${answer,,}" in
+    y|yes|"") ;;
+    n|no) echo "Откат отменён"; return 1 ;;
+    *) echo -e "${RED}Неверный ввод${RESET}"; return 1 ;;
+  esac
+
+  clear_project_files || return 1
+  copy_project_tree "$backup_dir/files" || return 1
+
+  if grep -q '^from_commit=' "$backup_dir/metadata" 2>/dev/null; then
+    from_commit=$(sed -n 's/^from_commit=//p' "$backup_dir/metadata" | head -n 1)
+    mkdir -p "$UPDATE_STATE_DIR"
+    printf '%s\n' "$from_commit" > "$UPDATE_STATE_DIR/current_commit"
+  fi
+
+  if rm -rf "$backup_dir"; then
+    echo -e "${GREEN}Использованная резервная копия удалена${RESET}"
+  else
+    echo -e "${YELLOW}Откат выполнен, но резервную копию удалить не удалось: $backup_dir${RESET}"
+  fi
+
+  echo -e "${GREEN}Откат успешно выполнен${RESET}"
+  exit 0
+}
+
 # Функция добавления домена в список
 add_domain() {
   local input="$1"
@@ -773,23 +1092,27 @@ while true; do
   echo ":: ОБНОВЛЕНИЯ"
   echo "4. Обновить список IPSet"
   echo "5. Обновить файл hosts"
+  echo "6. Обновить файлы проекта"
+  echo "7. Откатить последнее обновление"
   echo
   echo ":: ИНСТРУМЕНТЫ"
-  echo "6. Добавить домен в список"
-  echo "7. Запустить тесты"
+  echo "8. Добавить домен в список"
+  echo "9. Запустить тесты"
   echo
   echo "----------------------------------------"
   echo "0. Выход"
   echo
-  read -rp "Выберите опцию (0-7): " CHOICE || exit 0
+  read -rp "Выберите опцию (0-9): " CHOICE || exit 0
   case $CHOICE in
     1) toggle_game ;;
     2) ipset_menu ;;
     3) manage_zapret_service ;;
     4) update_ipset ;;
     5) update_hosts ;;
-    6) add_domains_menu ;;
-    7) run_zapret_tests ;;
+    6) update_project_files ;;
+    7) rollback_project_update ;;
+    8) add_domains_menu ;;
+    9) run_zapret_tests ;;
     0) clear; exit 0 ;;
     *) echo -e "${RED}Неверный выбор.${RESET}" ;;
   esac
