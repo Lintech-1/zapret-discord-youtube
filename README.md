@@ -86,6 +86,7 @@ nix.settings.experimental-features = [ "nix-command" "flakes" ];
             ipsetExclude = [ "203.0.113.0/24" ];
 
             # Необязательно: пользовательские hostlists и конфиги.
+            # extraHostlists может содержать несколько файлов.
             # Если нужен пример для GitHub, раскомментируйте блок ниже
             # и оставьте в configName выбранный вами готовый конфиг.
             #
@@ -96,6 +97,11 @@ nix.settings.experimental-features = [ "nix-command" "flakes" ];
             #   "objects.githubusercontent.com"
             #   "githubusercontent.com"
             #   "githubassets.com"
+            # ];
+            #
+            # extraHostlists."list-custom.txt" = [
+            #   "example.com"
+            #   "example.org"
             # ];
             #
             # nfqwsAppend = [
